@@ -538,6 +538,9 @@ class IPAdapterUnifiedLoader:
         return {"required": {
             "model": ("MODEL", ),
             "preset": (['LIGHT - SD1.5 only (low strength)', 'STANDARD (medium strength)', 'VIT-G (medium strength)', 'PLUS (high strength)', 'PLUS FACE (portraits)', 'FULL FACE - SD1.5 only (portraits stronger)'], ),
+            "ipadapter_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
+            "clipvision_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
+            "insightface_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
         },
         "optional": {
             "ipadapter": ("IPADAPTER", ),
@@ -548,7 +551,7 @@ class IPAdapterUnifiedLoader:
     FUNCTION = "load_models"
     CATEGORY = "ipadapter"
 
-    def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None):
+    def load_models(self, model, preset, ipadapter_device, clipvision_device, insightface_device, lora_strength=0.0, provider="CPU", ipadapter=None):
         pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } }
         if ipadapter is not None:
             pipeline = ipadapter
@@ -566,6 +569,16 @@ class IPAdapterUnifiedLoader:
             else:
                 self.clipvision = pipeline['clipvision']
 
+        # Attempt to move CLIPVision model components to specified device
+        try:
+            if hasattr(self.clipvision['model'], 'visual'):
+                self.clipvision['model'].visual = self.clipvision['model'].visual.to(clipvision_device)
+                print(f"\033[33mINFO: Clip Vision model's visual component moved to {clipvision_device}\033[0m")
+            else:
+                print(f"\033[33mWARNING: Unable to move Clip Vision model to {clipvision_device}. Model structure doesn't match expectations.\033[0m")
+        except Exception as e:
+            print(f"\033[33mWARNING: Error moving Clip Vision model to {clipvision_device}. Using default device. Error: {str(e)}\033[0m")
+
         # 2. Load the ipadapter model
         is_sdxl = isinstance(model.model, (comfy.model_base.SDXL, comfy.model_base.SDXLRefiner, comfy.model_base.SDXL_instructpix2pix))
         ipadapter_file, is_insightface, lora_pattern = get_ipadapter_file(preset, is_sdxl)
@@ -576,9 +589,11 @@ class IPAdapterUnifiedLoader:
             if pipeline['ipadapter']['file'] != ipadapter_file:
                 self.ipadapter['file'] = ipadapter_file
                 self.ipadapter['model'] = ipadapter_model_loader(ipadapter_file)
-                print(f"\033[33mINFO: IPAdapter model loaded from {ipadapter_file}\033[0m")
+                self.ipadapter['model'] = {k: v.to(ipadapter_device) if isinstance(v, torch.Tensor) else v for k, v in self.ipadapter['model'].items()}
+                print(f"\033[33mINFO: IPAdapter model loaded from {ipadapter_file} to {ipadapter_device}\033[0m")
             else:
                 self.ipadapter = pipeline['ipadapter']
+                self.ipadapter['model'] = {k: v.to(ipadapter_device) if isinstance(v, torch.Tensor) else v for k, v in self.ipadapter['model'].items()}
 
         # 3. Load the lora model if needed
         if lora_pattern is not None:
@@ -611,6 +626,14 @@ class IPAdapterUnifiedLoader:
                     print(f"\033[33mINFO: InsightFace model loaded with {provider} provider\033[0m")
                 else:
                     self.insightface = pipeline['insightface']
+            
+            # Move InsightFace model to specified device if possible
+            if hasattr(self.insightface['model'], 'to'):
+                try:
+                    self.insightface['model'] = self.insightface['model'].to(insightface_device)
+                    print(f"\033[33mINFO: InsightFace model moved to {insightface_device}\033[0m")
+                except Exception as e:
+                    print(f"\033[33mWARNING: Unable to move InsightFace model to {insightface_device}. Using default device. Error: {str(e)}\033[0m")
 
         return (model, { 'clipvision': self.clipvision, 'ipadapter': self.ipadapter, 'insightface': self.insightface }, )
 
@@ -646,15 +669,25 @@ class IPAdapterUnifiedLoaderCommunity(IPAdapterUnifiedLoader):
 class IPAdapterModelLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "ipadapter_file": (folder_paths.get_filename_list("ipadapter"), )}}
+        return {
+            "required": {
+                "ipadapter_file": (folder_paths.get_filename_list("ipadapter"), ),
+                "device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
+            }
+        }
 
     RETURN_TYPES = ("IPADAPTER",)
     FUNCTION = "load_ipadapter_model"
     CATEGORY = "ipadapter/loaders"
 
-    def load_ipadapter_model(self, ipadapter_file):
+    def load_ipadapter_model(self, ipadapter_file, device):
         ipadapter_file = folder_paths.get_full_path("ipadapter", ipadapter_file)
-        return (ipadapter_model_loader(ipadapter_file),)
+        model = ipadapter_model_loader(ipadapter_file)
+        
+        # Move the model to the specified device
+        model = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in model.items()}
+        
+        return (model,)
 
 class IPAdapterInsightFaceLoader:
     @classmethod
