@@ -539,8 +539,6 @@ class IPAdapterUnifiedLoader:
             "model": ("MODEL", ),
             "preset": (['LIGHT - SD1.5 only (low strength)', 'STANDARD (medium strength)', 'VIT-G (medium strength)', 'PLUS (high strength)', 'PLUS FACE (portraits)', 'FULL FACE - SD1.5 only (portraits stronger)'], ),
             "ipadapter_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
-            "clipvision_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
-            "insightface_device": ([f"cuda:{i}" for i in range(torch.cuda.device_count())] + ["cpu"], ),
         },
         "optional": {
             "ipadapter": ("IPADAPTER", ),
@@ -551,12 +549,28 @@ class IPAdapterUnifiedLoader:
     FUNCTION = "load_models"
     CATEGORY = "ipadapter"
 
-    def load_models(self, model, preset, ipadapter_device, clipvision_device, insightface_device, lora_strength=0.0, provider="CPU", ipadapter=None):
+    def recursive_move_to_device(self, obj, device):
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device)
+        elif isinstance(obj, dict):
+            return {k: self.recursive_move_to_device(v, device) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.recursive_move_to_device(item, device) for item in obj]
+        elif hasattr(obj, 'to') and callable(getattr(obj, 'to')):
+            return obj.to(device)
+        else:
+            return obj
+
+    def load_models(self, model, preset, ipadapter_device, lora_strength=0.0, provider="CPU", ipadapter=None):
         pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } }
         if ipadapter is not None:
             pipeline = ipadapter
 
-        # 1. Load the clipvision model
+        # Move the main model to the specified device
+        model.model = self.recursive_move_to_device(model.model, ipadapter_device)
+        print(f"\033[33mINFO: Main model moved to {ipadapter_device}\033[0m")
+
+        # 1. Load and move the clipvision model
         clipvision_file = get_clipvision_file(preset)
         if clipvision_file is None:
             raise Exception("ClipVision model not found.")
@@ -569,17 +583,10 @@ class IPAdapterUnifiedLoader:
             else:
                 self.clipvision = pipeline['clipvision']
 
-        # Attempt to move CLIPVision model components to specified device
-        try:
-            if hasattr(self.clipvision['model'], 'visual'):
-                self.clipvision['model'].visual = self.clipvision['model'].visual.to(clipvision_device)
-                print(f"\033[33mINFO: Clip Vision model's visual component moved to {clipvision_device}\033[0m")
-            else:
-                print(f"\033[33mWARNING: Unable to move Clip Vision model to {clipvision_device}. Model structure doesn't match expectations.\033[0m")
-        except Exception as e:
-            print(f"\033[33mWARNING: Error moving Clip Vision model to {clipvision_device}. Using default device. Error: {str(e)}\033[0m")
+        self.clipvision['model'] = self.recursive_move_to_device(self.clipvision['model'], ipadapter_device)
+        print(f"\033[33mINFO: Clip Vision model moved to {ipadapter_device}\033[0m")
 
-        # 2. Load the ipadapter model
+        # 2. Load and move the ipadapter model
         is_sdxl = isinstance(model.model, (comfy.model_base.SDXL, comfy.model_base.SDXLRefiner, comfy.model_base.SDXL_instructpix2pix))
         ipadapter_file, is_insightface, lora_pattern = get_ipadapter_file(preset, is_sdxl)
         if ipadapter_file is None:
@@ -589,13 +596,14 @@ class IPAdapterUnifiedLoader:
             if pipeline['ipadapter']['file'] != ipadapter_file:
                 self.ipadapter['file'] = ipadapter_file
                 self.ipadapter['model'] = ipadapter_model_loader(ipadapter_file)
-                self.ipadapter['model'] = {k: v.to(ipadapter_device) if isinstance(v, torch.Tensor) else v for k, v in self.ipadapter['model'].items()}
-                print(f"\033[33mINFO: IPAdapter model loaded from {ipadapter_file} to {ipadapter_device}\033[0m")
+                print(f"\033[33mINFO: IPAdapter model loaded from {ipadapter_file}\033[0m")
             else:
                 self.ipadapter = pipeline['ipadapter']
-                self.ipadapter['model'] = {k: v.to(ipadapter_device) if isinstance(v, torch.Tensor) else v for k, v in self.ipadapter['model'].items()}
 
-        # 3. Load the lora model if needed
+        self.ipadapter['model'] = self.recursive_move_to_device(self.ipadapter['model'], ipadapter_device)
+        print(f"\033[33mINFO: IPAdapter model moved to {ipadapter_device}\033[0m")
+
+        # 3. Load and move the lora model if needed
         if lora_pattern is not None:
             lora_file = get_lora_file(lora_pattern)
             lora_model = None
@@ -617,7 +625,7 @@ class IPAdapterUnifiedLoader:
             if lora_strength > 0:
                 model, _ = load_lora_for_models(model, None, lora_model, lora_strength, 0)
 
-        # 4. Load the insightface model if needed
+        # 4. Load and move the insightface model if needed
         if is_insightface:
             if provider != self.insightface['provider']:
                 if pipeline['insightface']['provider'] != provider:
@@ -627,13 +635,12 @@ class IPAdapterUnifiedLoader:
                 else:
                     self.insightface = pipeline['insightface']
             
-            # Move InsightFace model to specified device if possible
-            if hasattr(self.insightface['model'], 'to'):
-                try:
-                    self.insightface['model'] = self.insightface['model'].to(insightface_device)
-                    print(f"\033[33mINFO: InsightFace model moved to {insightface_device}\033[0m")
-                except Exception as e:
-                    print(f"\033[33mWARNING: Unable to move InsightFace model to {insightface_device}. Using default device. Error: {str(e)}\033[0m")
+            self.insightface['model'] = self.recursive_move_to_device(self.insightface['model'], ipadapter_device)
+            print(f"\033[33mINFO: InsightFace model moved to {ipadapter_device}\033[0m")
+
+        # Final check to ensure all components are on the same device
+        model.model = self.recursive_move_to_device(model.model, ipadapter_device)
+        print(f"\033[33mINFO: Final check - All model components moved to {ipadapter_device}\033[0m")
 
         return (model, { 'clipvision': self.clipvision, 'ipadapter': self.ipadapter, 'insightface': self.insightface }, )
 
